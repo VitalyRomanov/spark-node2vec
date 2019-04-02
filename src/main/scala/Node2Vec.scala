@@ -4,7 +4,7 @@ import org.apache.log4j.Logger
 import org.apache.log4j.Level
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.mllib.random.UniformGenerator
-import breeze.linalg.{DenseMatrix, DenseVector, Vector, sum}
+import breeze.linalg.{DenseMatrix, DenseVector}
 import breeze.numerics.log
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
@@ -13,12 +13,21 @@ import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructT
 object utils {
   def read_data(path: String, spark: SparkSession): RDD[(Int, Int)] = {
     spark.read.format("csv")
+      // the original data is store in CSV format
+      // header: source_node, destination_node
+      // here we read the data from CSV and export it as RDD[(Int, Int)],
+      // i.e. as RDD of edges
       .option("header", "true")
+      // State that the header is present in the file
       .schema(StructType(Array(
         StructField("source_node", IntegerType, false),
         StructField("destination_node", IntegerType, false)
       )))
-      .load(path).rdd.map(row => (row.getAs[Int](0), row.getAs[Int](1)))
+      // Define schema of the input data
+      .load(path)
+      // Read the file as DataFrame
+      .rdd.map(row => (row.getAs[Int](0), row.getAs[Int](1)))
+      // Interpret DF as RDD
   }
 
   def create_embedding_matrix(vocab_size: Int, emb_size: Int) = {
@@ -30,16 +39,6 @@ object utils {
   def blank_gradient_matrix(vocab_size: Int, emb_size: Int) = {
     val data = Array.fill(vocab_size*emb_size)(0.0f)
     new DenseMatrix(emb_size, vocab_size, data)
-  }
-
-  def create_random_vector(vector_size: Int) = {
-    val gen = new UniformGenerator()
-    val data = Array.fill(vector_size)(gen.nextValue().toFloat - 0.5f)// / emb_size)
-    new DenseVector(data)
-  }
-
-  def create_distributed_matrix(n_rows: Int, n_columns: Int, spark: SparkContext) = {
-    spark.parallelize(0 to n_rows-1).map((_, create_random_vector(n_columns)))
   }
 
   def add_batch_index(data: RDD[(Int, Int)], batch_size: Int) = {
@@ -61,6 +60,10 @@ object nn {
   def sigm(x: Double ) = {
     (1 / (1 + Math.exp(-x)))
   }
+
+//  def sigm(x: Float ) = {
+//    (1 / (1 + Math.exp(-x)))
+//  }
 
   def loss(x: Double) = {
     -log(sigm(x))
@@ -141,75 +144,94 @@ object Node2Vec {
 
     val sc: SparkContext = spark.sparkContext
 
-    val data = utils.read_data(data_path, spark)
-    val test = utils.read_data(test_data, spark)
+    println("Usage: train test emb_dim learning_rate epochs")
+
+    val batch_size = 10000
+    val total_nodes = 40334 //943150
+    val emb_dim = args(2).toInt
+    val learning_rate = args(3).toFloat
+    val epochs = args(4).toInt
+
+
+    println("Reading data")
+
+    var data = utils.read_data(data_path, spark)
+    val test = utils.read_data(test_data, spark).repartition(100)
 //    val data = sc.parallelize(utils.read_data(data_path, spark).take(10))
 
 
-
-    val batch_size = 50000
-    val total_nodes = 1000000 //943150
-    val emb_dim = 100
-    val learning_rate = 10.0f
-
     val in_emb = utils.create_embedding_matrix(total_nodes, emb_dim)
     val out_emb = utils.create_embedding_matrix(total_nodes, emb_dim)
-//    val in_emb = utils.create_distributed_matrix(total_nodes, emb_dim, sc)
-//    val out_emb = utils.create_distributed_matrix(total_nodes, emb_dim, sc)
+
+    println("Creating batches")
 
     val batches =  utils.partition(data, batch_size)
+//    val batches =  utils.partition(sc.parallelize(data.take(100)), batch_size)
+
+    data = null
+
+    println("Begin training")
+
+    for (e <- 1 to epochs) {
+      for (batch <- batches) {
+        var in_broad = sc.broadcast(in_emb)
+        var out_broad = sc.broadcast(out_emb)
+
+        var likelihood = test
+          .map(x => nn.estimate_likelihood(x._1, x._2, in_broad.value, out_broad.value))
+          .reduce(_ + _)
+
+        println(s"Epoch $e Loss ${likelihood / test.count()}")
+
+        //      println(s"${batch.count()}")
+
+        //      println(s"Check sum ${sum(in_emb)}")
+
+        var grads = batch.repartition(100)
+          .map(pair => nn.gradients(pair._1, pair._2, in_broad.value, out_broad.value, 20))
+
+        def gradient_updates(grads: RDD[(Int, DenseVector[Float])]) = {
+          val a_grad = nn.collect_gradients(grads)
+          val blank = utils.blank_gradient_matrix(total_nodes, emb_dim)
+
+          for (k <- a_grad.keys) {
+            blank(::, k) := a_grad(k)
+          }
+
+          blank
+        }
+
+        in_emb -= gradient_updates(grads.flatMap(x => x._1)) * learning_rate
+        out_emb -= gradient_updates(grads.flatMap(x => x._2)) * learning_rate
 
 
-
-    for (batch <- batches) {
-      val in_broad = sc.broadcast(in_emb)
-      val out_broad = sc.broadcast(out_emb)
-
-      val likelihood = test
-        .map(x => nn.estimate_likelihood(x._1, x._2, in_broad.value, out_broad.value))
-        .reduce(_+_)
-
-      println(s"Loss ${likelihood / test.count()}")
-
-//      println(s"${batch.count()}")
-
-//      println(s"Check sum ${sum(in_emb)}")
-
-      val grads = batch.map( pair => nn.gradients(pair._1, pair._2, in_broad.value, out_broad.value, 20))
-
-      val in_grads = grads.flatMap(x => x._1)
-      val out_grads = grads.flatMap(x => x._2)
-
-      val a_in_grad = nn.collect_gradients(in_grads)
-      val a_out_grad = nn.collect_gradients(out_grads)
-
-      val in_blank = utils.blank_gradient_matrix(total_nodes, emb_dim)
-      val out_blank = utils.blank_gradient_matrix(total_nodes, emb_dim)
-
-      for (k <- a_in_grad.keys){
-        in_blank(::, k) := a_in_grad(k)
       }
-
-      for (k <- a_out_grad.keys){
-        out_blank(::, k) := a_out_grad(k)
-      }
-
-//      println(s"In Check sum ${sum(in_blank)}")
-//      println(s"Out Check sum ${sum(out_blank)}")
-
-      in_emb -= in_blank * learning_rate
-      out_emb -= out_blank * learning_rate
-
-
-
     }
 
+    def get_top(source: Int, top_k: Int) = {
+      var act = Array[(Int,Float)]()
 
+      for (destination <- 0 to total_nodes-1) {
+//      for (destination <- 0 to 100) {
+        if (source != destination)
+          act :+= (destination, in_emb(::, source).t * out_emb(::, destination))
+      }
 
-//    val repartitioned_for_batches = data.repartition(n_partitions)
-//    data.zipWithIndex().map(x => ((x._2 / batch_size).toInt, x._1)).groupByKey().lookup(0).foreach(println)
+      val r = act.sortBy(_._2).takeRight(top_k).reverse
 
+      (r.map(_._1), r.map(_._2))
+    }
 
+    val results = sc.parallelize(0 to total_nodes-1).repartition(100)
+      .map( x => (x, get_top(x, 10)))
+
+    results.map(x => (x._1, x._2._1.mkString(" ")))
+      .map(x => s"${x._1}, ${x._2}")
+      .saveAsTextFile("result_destination.csv")
+
+    results.map(x => (x._1, x._2._2.mkString(" ")))
+      .map(x => s"${x._1}, ${x._2}")
+      .saveAsTextFile("result_score.csv")
 
   }
 }
