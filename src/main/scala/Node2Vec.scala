@@ -1,10 +1,11 @@
+import java.io.File
 import java.util.Random
 
 import org.apache.log4j.Logger
 import org.apache.log4j.Level
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.mllib.random.UniformGenerator
-import breeze.linalg.{DenseMatrix, DenseVector}
+import breeze.linalg.{DenseMatrix, DenseVector, convert, csvwrite, norm}
 import breeze.numerics.log
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
@@ -123,7 +124,22 @@ object nn {
 
     nn.loss(in.t * out)
   }
+
+  def lr_schedule(epoch:Int, min: Float, max: Float, max_epochs: Int) = {
+    if (epoch < max_epochs/2){
+      epoch / max_epochs / 2 * (max-min) + min
+    } else {
+      - (epoch - max_epochs / 2) / max_epochs / 2 * (max-min) + max
+    }
+  }
+
+  def lr_anneal(epoch:Int, min: Float, max: Float, max_epochs: Int) = {
+    - epoch.toFloat / max_epochs * (max-min) + max
+  }
+
 }
+
+
 
 
 
@@ -144,19 +160,20 @@ object Node2Vec {
 
     val sc: SparkContext = spark.sparkContext
 
-    println("Usage: train test emb_dim learning_rate epochs")
+    println("Usage: train test emb_dim learning_rate epochs heat_factor")
 
-    val batch_size = 10000
+    val batch_size = 20000
     val total_nodes = 40334 //943150
     val emb_dim = args(2).toInt
     val learning_rate = args(3).toFloat
     val epochs = args(4).toInt
+    val heat_factor = args(5).toFloat
 
 
     println("Reading data")
 
-    var data = utils.read_data(data_path, spark)
-    val test = utils.read_data(test_data, spark).repartition(100)
+    var data = utils.read_data(data_path, spark).repartition(1000)
+    val test = utils.read_data(test_data, spark).repartition(1000)
 //    val data = sc.parallelize(utils.read_data(data_path, spark).take(10))
 
 
@@ -168,6 +185,7 @@ object Node2Vec {
     val batches =  utils.partition(data, batch_size)
 //    val batches =  utils.partition(sc.parallelize(data.take(100)), batch_size)
 
+    val train_edges = data.collect().toSet
     data = null
 
     println("Begin training")
@@ -181,34 +199,53 @@ object Node2Vec {
           .map(x => nn.estimate_likelihood(x._1, x._2, in_broad.value, out_broad.value))
           .reduce(_ + _)
 
-        println(s"Epoch $e Loss ${likelihood / test.count()}")
+
 
         //      println(s"${batch.count()}")
 
         //      println(s"Check sum ${sum(in_emb)}")
 
-        var grads = batch.repartition(100)
+        var grads = batch.repartition(1000)
           .map(pair => nn.gradients(pair._1, pair._2, in_broad.value, out_broad.value, 20))
 
-        def gradient_updates(grads: RDD[(Int, DenseVector[Float])]) = {
+        def gradient_updates(grads: RDD[(Int, DenseVector[Float])],
+                             weights: DenseMatrix[Float],
+                             learning_rate: Float) = {
           val a_grad = nn.collect_gradients(grads)
-          val blank = utils.blank_gradient_matrix(total_nodes, emb_dim)
+//          val blank = utils.blank_gradient_matrix(total_nodes, emb_dim)
+
+          var accum_norm = 0.0f
 
           for (k <- a_grad.keys) {
-            blank(::, k) := a_grad(k)
+            weights(::, k) :-= a_grad(k) * learning_rate
+//            blank(::, k) := a_grad(k)
+            accum_norm += norm(a_grad(k)).toFloat
           }
 
-          blank
+          accum_norm /= a_grad.size // normalize by number of gradients
+
+//          (blank, accum_norm)
+          accum_norm
         }
 
-        in_emb -= gradient_updates(grads.flatMap(x => x._1)) * learning_rate
-        out_emb -= gradient_updates(grads.flatMap(x => x._2)) * learning_rate
+//        in_emb -= gradient_updates(grads.flatMap(x => x._1)) * learning_rate
+//        out_emb -= gradient_updates(grads.flatMap(x => x._2)) * learning_rate
+//        val lr = nn.lr_schedule(e, learning_rate, learning_rate * hear_factor, epochs)
+        var lr = nn.lr_anneal(e, learning_rate * heat_factor, learning_rate, epochs)
+
+        val in_norm = gradient_updates(grads.flatMap(x => x._1), in_emb, lr)
+        val out_norm = gradient_updates(grads.flatMap(x => x._2), out_emb, lr)
+
+        println(s"Epoch $e Loss ${likelihood / test.count()} lr: ${lr} grad norm: ${(in_norm + out_norm)/2.0f}")
+
+//        in_emb -= in_updates * lr
+//        out_emb -= out_updates * lr
 
 
       }
     }
 
-    def get_top(source: Int, top_k: Int) = {
+    def get_top(source: Int, top_k: Int, existing_edges: Set[(Int, Int)]) = {
       var act = Array[(Int,Float)]()
 
       for (destination <- 0 to total_nodes-1) {
@@ -217,13 +254,25 @@ object Node2Vec {
           act :+= (destination, in_emb(::, source).t * out_emb(::, destination))
       }
 
-      val r = act.sortBy(_._2).takeRight(top_k).reverse
+      val r = act.sortBy(_._2)
+        .filter(x => !existing_edges.contains((source, x._1)))
+        .takeRight(top_k)
+        .reverse
 
       (r.map(_._1), r.map(_._2))
     }
 
-    val results = sc.parallelize(0 to total_nodes-1).repartition(100)
-      .map( x => (x, get_top(x, 10)))
+    print("Saving weights...")
+    csvwrite(new File("in_matr.csv"), convert(in_emb, Double), ',')
+    csvwrite(new File("out_matr.csv"), convert(out_emb, Double), ',')
+    println("done")
+
+    val test_nodes = test.map(_._1)
+
+
+    val results = test_nodes.repartition(1000)
+      .map( x => (x, get_top(x, 10, train_edges)))
+        .map( x => (x._1, x._2))
 
     results.map(x => (x._1, x._2._1.mkString(" ")))
       .map(x => s"${x._1}, ${x._2}")
